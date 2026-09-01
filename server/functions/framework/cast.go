@@ -174,11 +174,25 @@ func GetAssignmentCast(fromType *pgtypes.DoltgresType, toType *pgtypes.DoltgresT
 	}
 	// We check for the identity after checking the maps, as the identity may be overridden (such as for types that have
 	// parameters). If the "to" type is a string type, then we do not use the identity, and use the I/O conversion below.
-	if fromType.ID == toType.ID && fromType.TypCategory != pgtypes.TypeCategory_StringTypes {
+	if fromType.ID == toType.ID && fromType.TypCategory != pgtypes.TypeCategory_StringTypes && fromType.TypCategory != pgtypes.TypeCategory_BitStringTypes {
 		return IdentityCast
 	}
+
 	// All types have a built-in assignment cast to string types: https://www.postgresql.org/docs/15/sql-createcast.html
+	// This is also where length checks occur for types like char(n), varchar(n), bit(n), etc., which is not great
+	// TODO: move length checks to their own analyzer step
 	if toType.TypCategory == pgtypes.TypeCategory_StringTypes {
+		return func(ctx *sql.Context, val any, targetType *pgtypes.DoltgresType) (any, error) {
+			if val == nil {
+				return nil, nil
+			}
+			str, err := fromType.IoOutput(ctx, val)
+			if err != nil {
+				return nil, err
+			}
+			return targetType.IoInput(ctx, str)
+		}
+	} else if toType.TypCategory == pgtypes.TypeCategory_BitStringTypes {
 		return func(ctx *sql.Context, val any, targetType *pgtypes.DoltgresType) (any, error) {
 			if val == nil {
 				return nil, nil

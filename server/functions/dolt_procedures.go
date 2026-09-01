@@ -15,21 +15,28 @@
 package functions
 
 import (
+	"fmt"
 	"io"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dprocedures"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/types"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dprocedures"
+
+	"github.com/dolthub/doltgresql/server/auth"
 	"github.com/dolthub/doltgresql/server/functions/framework"
 	pgtypes "github.com/dolthub/doltgresql/server/types"
 )
+
+// doltExternalProcedures caches resolved Dolt procedures for quick lookup by name.
+var doltExternalProcedures = make(map[string]*plan.ExternalProcedure)
 
 func initDoltProcedures() {
 	for _, procDef := range dprocedures.DoltProcedures {
@@ -38,9 +45,11 @@ func initDoltProcedures() {
 			panic(err)
 		}
 
+		doltExternalProcedures[strings.ToLower(procDef.Name)] = p
+
 		funcVal := reflect.ValueOf(procDef.Function)
 		varArgCallable := varArgCallableForDoltProcedure(p, funcVal)
-		noArgCallable := noArgCallableForDoltProcedure(funcVal)
+		noArgCallable := noArgCallableForDoltProcedure(p, funcVal)
 
 		framework.RegisterFunction(framework.Function1{
 			Name:       procDef.Name,
@@ -57,12 +66,43 @@ func initDoltProcedures() {
 	}
 }
 
+// GetDoltStoredProcedure returns the cached ExternalProcedure for the given Dolt procedure name. Returns nil if the
+// procedure is not found.
+func GetDoltStoredProcedure(procedureName string) *plan.ExternalProcedure {
+	return doltExternalProcedures[strings.ToLower(procedureName)]
+}
+
+// CheckDoltStoredProcedureAccess verifies the user has permission to execute the given Dolt procedure. For AdminOnly
+// procedures, the user must have SUPERUSER role.
+func CheckDoltStoredProcedureAccess(ctx *sql.Context, procName string) error {
+	// TODO: This auth check should be handled by AuthType_EXECUTE in auth_handler.go when procedure auth is integrated
+	//  into the authorization system.
+	proc := GetDoltStoredProcedure(procName)
+	if proc == nil || !proc.AdminOnly {
+		return nil
+	}
+
+	var userRole auth.Role
+	auth.LockRead(func() {
+		userRole = auth.GetRole(ctx.Client().User)
+	})
+
+	if !userRole.IsValid() || !userRole.IsSuperUser {
+		return fmt.Errorf("permission denied for procedure %s", procName)
+	}
+	return nil
+}
+
 // varArgCallableForDoltProcedure creates a callable function that takes in a variadic number of parameters. This is
 // equivalent to calling "DOLT_PROC_NAME('abc', ...)".
 func varArgCallableForDoltProcedure(p *plan.ExternalProcedure, funcVal reflect.Value) func(ctx *sql.Context, paramsAndReturn [2]*pgtypes.DoltgresType, val1 any) (any, error) {
 	funcType := funcVal.Type()
 
 	return func(ctx *sql.Context, paramsAndReturn [2]*pgtypes.DoltgresType, val1 any) (any, error) {
+		if err := CheckDoltStoredProcedureAccess(ctx, p.Name); err != nil {
+			return nil, err
+		}
+
 		values, ok := val1.([]any)
 		if !ok {
 			return nil, sql.ErrExternalProcedureInvalidParamType.New(reflect.TypeOf(val1).String())
@@ -111,8 +151,12 @@ func varArgCallableForDoltProcedure(p *plan.ExternalProcedure, funcVal reflect.V
 
 // noArgCallableForDoltProcedure creates a callable function that does not take any parameters. This is equivalent to
 // calling "DOLT_PROC_NAME()".
-func noArgCallableForDoltProcedure(funcVal reflect.Value) func(ctx *sql.Context) (any, error) {
+func noArgCallableForDoltProcedure(p *plan.ExternalProcedure, funcVal reflect.Value) func(ctx *sql.Context) (any, error) {
 	return func(ctx *sql.Context) (any, error) {
+		if err := CheckDoltStoredProcedureAccess(ctx, p.Name); err != nil {
+			return nil, err
+		}
+
 		funcParams := []reflect.Value{reflect.ValueOf(ctx)}
 		out := funcVal.Call(funcParams)
 		if err, ok := out[1].Interface().(error); ok { // Only evaluates to true when error is not nil
